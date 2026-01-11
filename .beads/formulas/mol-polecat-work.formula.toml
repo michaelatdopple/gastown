@@ -1,5 +1,5 @@
 description = """
-Full polecat work lifecycle from assignment through MR submission.
+Full polecat work lifecycle from assignment through work completion.
 
 This molecule guides a polecat through a complete work assignment. Each step
 has clear entry/exit criteria and specific commands to run. A polecat can
@@ -10,23 +10,25 @@ crash after any step and resume from the last completed step.
 You are an ephemeral worker. You:
 1. Receive work via your hook (pinned molecule + issue)
 2. Work through molecule steps using `bd ready` / `bd close <step>`
-3. Submit to merge queue via `gt done`
-4. Become recyclable - Refinery handles the rest
+3. Complete work via `gt done --completion-type=<type>`
+4. Become recyclable - Refinery handles the rest (if MR type)
 
 **Important:** This formula defines the template. Your molecule already has step
 beads created from it. Use `bd ready` to find them - do NOT read this file directly.
 
-**You do NOT:**
-- Push directly to main (Refinery merges)
-- Close your own issue (Refinery closes after merge)
-- Wait for merge (you're done at MR submission)
-- Handle rebase conflicts (Refinery dispatches fresh polecats for that)
+**Completion types:**
+- `mr` (default): Submit to merge queue, Refinery merges
+- `direct`: Push directly to main (small fixes, no review)
+- `research`: No code changes, just findings/documentation
+- `docs`: Documentation work, creates MR if changes exist
+- `conflict`: Refinery-dispatched conflict resolution
 
 ## Variables
 
 | Variable | Source | Description |
 |----------|--------|-------------|
 | issue | hook_bead | The issue ID you're assigned to work on |
+| completion_type | molecule/flag | How to complete: mr, direct, research, docs, conflict |
 
 ## Failure Modes
 
@@ -37,7 +39,7 @@ beads created from it. Use `bd ready` to find them - do NOT read this file direc
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work"
-version = 4
+version = 5
 
 [[steps]]
 id = "load-context"
@@ -407,31 +409,38 @@ bd sync
 
 [[steps]]
 id = "submit-and-exit"
-title = "Submit to merge queue and exit"
+title = "Complete work and exit"
 needs = ["prepare-for-review"]
 description = """
-Submit your work to the merge queue. You become recyclable after this.
+Complete your work. You become recyclable after this.
 
 **Ephemeral Polecat Model:**
-Once you submit, you're done. The Refinery will:
-1. Process your merge request
-2. Handle rebasing (mechanical rebases done automatically)
-3. Close your issue after successful merge
-4. Create conflict-resolution tasks if needed (fresh polecat handles those)
+Once you complete, you're done. What happens next depends on completion type:
+- `mr`: Refinery processes merge request, handles rebasing, closes issue
+- `direct`: Changes already merged to main, issue closed immediately
+- `research`: No code changes, findings documented, issue closed
+- `docs`: MR created if changes exist, otherwise just closes issue
+- `conflict`: Re-submitted to merge queue after conflict resolution
 
-**1. Submit with gt done:**
+**1. Complete with gt done:**
 ```bash
+# Standard MR submission (default)
 gt done
+
+# Or with explicit completion type:
+gt done --completion-type=direct   # Merge directly to main
+gt done --completion-type=research # Research complete, no code
+gt done --completion-type=docs     # Documentation work
 ```
 
-This single command:
-- Creates an MR bead in the merge queue
+This command:
+- Handles completion based on type (MR, direct merge, or just close)
 - Notifies the Witness (POLECAT_DONE)
-- Updates your agent state to 'done'
+- Updates your agent state
 - Reports cleanup status (ZFC compliance)
 
-**2. Verify submission:**
-You should see output like:
+**2. Verify completion:**
+For MR type, you should see output like:
 ```
 ✓ Work submitted to merge queue
   MR ID: gt-xxxxx
@@ -440,8 +449,15 @@ You should see output like:
   Issue: {{issue}}
 ```
 
+For research/docs without changes:
+```
+✓ Research work complete
+  Issue: {{issue}}
+  No merge request created (research completion type).
+```
+
 **3. You're recyclable:**
-Your work is in the queue. The Witness knows you're done.
+Your work is complete. The Witness knows you're done.
 Your sandbox can be cleaned up - all work is pushed to origin.
 
 If you have context remaining, you may:
@@ -451,9 +467,13 @@ If you have context remaining, you may:
 If the Refinery needs conflict resolution, it will dispatch a fresh polecat.
 You do NOT need to wait around.
 
-**Exit criteria:** MR submitted, Witness notified, polecat recyclable."""
+**Exit criteria:** Work completed, Witness notified, polecat recyclable."""
 
 [vars]
 [vars.issue]
 description = "The issue ID assigned to this polecat"
 required = true
+
+[vars.completion_type]
+description = "How to complete work: mr (default), direct, research, docs, conflict"
+default = "mr"

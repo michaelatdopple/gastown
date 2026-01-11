@@ -27,13 +27,21 @@ This is a convenience command for polecats that:
 1. Submits the current branch to the merge queue
 2. Auto-detects issue ID from branch name
 3. Notifies the Witness with the exit outcome
-4. Optionally exits the Claude session (--exit flag)
+4. Self-nukes the sandbox (worktree cleanup) on COMPLETED status
+5. Exits the session automatically after completion
 
 Exit statuses:
   COMPLETED      - Work done, MR submitted (default)
   ESCALATED      - Hit blocker, needs human intervention
   DEFERRED       - Work paused, issue still open
   PHASE_COMPLETE - Phase done, awaiting gate (use --phase-complete)
+
+Completion types (how the work unit is completed):
+  mr        - Submit MR to merge queue (default, Refinery merges)
+  direct    - Push directly to main (small fixes, no review needed)
+  research  - No code changes, just findings/documentation
+  docs      - Documentation work, creates MR if changes exist
+  conflict  - Refinery-dispatched conflict resolution
 
 Phase handoff workflow:
   When a molecule has gate steps (async waits), use --phase-complete to signal
@@ -47,18 +55,21 @@ Examples:
   gt done --issue gt-abc               # Explicit issue ID
   gt done --status ESCALATED           # Signal blocker, skip MR
   gt done --status DEFERRED            # Pause work, skip MR
-  gt done --phase-complete --gate g-x  # Phase done, waiting on gate g-x`,
+  gt done --phase-complete --gate g-x  # Phase done, waiting on gate g-x
+  gt done --completion-type=direct     # Merge directly to main
+  gt done --completion-type=research   # Research complete, no code`,
 	RunE: runDone,
 }
 
 var (
-	doneIssue         string
-	donePriority      int
-	doneStatus        string
-	doneExit          bool
-	donePhaseComplete bool
-	doneGate          string
-	doneCleanupStatus string
+	doneIssue          string
+	donePriority       int
+	doneStatus         string
+	doneExit           bool
+	donePhaseComplete  bool
+	doneGate           string
+	doneCleanupStatus  string
+	doneCompletionType string
 )
 
 // Valid exit types for gt done
@@ -69,6 +80,16 @@ const (
 	ExitPhaseComplete = "PHASE_COMPLETE"
 )
 
+// Valid completion types for work units
+// These describe HOW a polecat completes their work, not just the exit status.
+const (
+	CompletionMR       = "mr"       // Submit to merge queue (default, current behavior)
+	CompletionDirect   = "direct"   // Merge directly to main (small fixes)
+	CompletionResearch = "research" // No code changes, just findings/documentation
+	CompletionDocs     = "docs"     // Documentation work, may or may not need MR
+	CompletionConflict = "conflict" // Refinery-dispatched conflict resolution
+)
+
 func init() {
 	doneCmd.Flags().StringVar(&doneIssue, "issue", "", "Source issue ID (default: parse from branch name)")
 	doneCmd.Flags().IntVarP(&donePriority, "priority", "p", -1, "Override priority (0-4, default: inherit from issue)")
@@ -77,6 +98,7 @@ func init() {
 	doneCmd.Flags().BoolVar(&donePhaseComplete, "phase-complete", false, "Signal phase complete - await gate before continuing")
 	doneCmd.Flags().StringVar(&doneGate, "gate", "", "Gate bead ID to wait on (with --phase-complete)")
 	doneCmd.Flags().StringVar(&doneCleanupStatus, "cleanup-status", "", "Git cleanup status: clean, uncommitted, unpushed, stash, unknown (ZFC: agent-observed)")
+	doneCmd.Flags().StringVar(&doneCompletionType, "completion-type", CompletionMR, "Work completion type: mr, direct, research, docs, conflict")
 
 	rootCmd.AddCommand(doneCmd)
 }
@@ -95,6 +117,15 @@ func runDone(cmd *cobra.Command, args []string) error {
 		if exitType != ExitCompleted && exitType != ExitEscalated && exitType != ExitDeferred {
 			return fmt.Errorf("invalid exit status '%s': must be COMPLETED, ESCALATED, or DEFERRED", doneStatus)
 		}
+	}
+
+	// Validate completion type
+	completionType := strings.ToLower(doneCompletionType)
+	switch completionType {
+	case CompletionMR, CompletionDirect, CompletionResearch, CompletionDocs, CompletionConflict:
+		// Valid
+	default:
+		return fmt.Errorf("invalid completion type '%s': must be mr, direct, research, docs, or conflict", doneCompletionType)
 	}
 
 	// Find workspace
@@ -158,110 +189,126 @@ func runDone(cmd *cobra.Command, args []string) error {
 		defaultBranch = rigCfg.DefaultBranch
 	}
 
-	// For COMPLETED, we need an issue ID and branch must not be the default branch
+	// For COMPLETED, handle based on completion type
 	var mrID string
 	if exitType == ExitCompleted {
-		if branch == defaultBranch || branch == "master" {
-			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
-		}
-		// Check that branch has commits ahead of default branch (prevents submitting stale branches)
-		aheadCount, err := g.CommitsAhead(defaultBranch, branch)
-		if err != nil {
-			return fmt.Errorf("checking commits ahead of %s: %w", defaultBranch, err)
-		}
-		if aheadCount == 0 {
-			return fmt.Errorf("branch '%s' has 0 commits ahead of %s; nothing to merge", branch, defaultBranch)
-		}
-
-		if issueID == "" {
-			return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
-		}
-
-		// Initialize beads
+		// Initialize beads early - needed for all completion types
 		bd := beads.New(beads.ResolveBeadsDir(cwd))
 
-		// Determine target branch (auto-detect integration branch if applicable)
-		target := defaultBranch
-		autoTarget, err := detectIntegrationBranch(bd, g, issueID)
-		if err == nil && autoTarget != "" {
-			target = autoTarget
-		}
+		switch completionType {
+		case CompletionResearch:
+			// Research/investigation - no code changes expected
+			// Can be on any branch, no MR needed
+			fmt.Printf("%s Research work complete\n", style.Bold.Render("✓"))
+			if issueID != "" {
+				fmt.Printf("  Issue: %s\n", issueID)
+			}
+			fmt.Printf("  Branch: %s\n", branch)
+			fmt.Println()
+			fmt.Printf("%s\n", style.Dim.Render("No merge request created (research completion type)."))
 
-		// Get source issue for priority inheritance
-		var priority int
-		if donePriority >= 0 {
-			priority = donePriority
-		} else {
-			// Try to inherit from source issue
-			sourceIssue, err := bd.Show(issueID)
-			if err != nil {
-				priority = 2 // Default
+		case CompletionDirect:
+			// Direct merge to main - for small fixes, no review needed
+			// Polecat pushes directly to main
+			if branch == defaultBranch || branch == "master" {
+				// Already on main, just need to push
+				fmt.Printf("%s Direct completion on %s\n", style.Bold.Render("✓"), branch)
 			} else {
-				priority = sourceIssue.Priority
+				// On a feature branch - merge to main and push
+				aheadCount, err := g.CommitsAhead(defaultBranch, branch)
+				if err != nil {
+					return fmt.Errorf("checking commits ahead of %s: %w", defaultBranch, err)
+				}
+				if aheadCount == 0 {
+					return fmt.Errorf("branch '%s' has 0 commits ahead of %s; nothing to merge", branch, defaultBranch)
+				}
+
+				// Checkout main, merge feature branch, push
+				fmt.Printf("%s Direct merge to %s\n", style.Bold.Render("→"), defaultBranch)
+				if err := g.Checkout(defaultBranch); err != nil {
+					return fmt.Errorf("checking out %s: %w", defaultBranch, err)
+				}
+				if err := g.Merge(branch); err != nil {
+					// Restore original branch on failure
+					_ = g.Checkout(branch)
+					return fmt.Errorf("merging %s into %s: %w", branch, defaultBranch, err)
+				}
+				if err := g.Push("origin", defaultBranch, false); err != nil {
+					return fmt.Errorf("pushing to %s: %w", defaultBranch, err)
+				}
+
+				fmt.Printf("%s Merged and pushed to %s\n", style.Bold.Render("✓"), defaultBranch)
+				fmt.Printf("  Source: %s\n", branch)
 			}
-		}
-
-		// Check if MR bead already exists for this branch (idempotency)
-		existingMR, err := bd.FindMRForBranch(branch)
-		if err != nil {
-			style.PrintWarning("could not check for existing MR: %v", err)
-			// Continue with creation attempt - Create will fail if duplicate
-		}
-
-		if existingMR != nil {
-			// MR already exists - use it instead of creating a new one
-			mrID = existingMR.ID
-			fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
-			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
-		} else {
-			// Build MR bead title and description
-			title := fmt.Sprintf("Merge: %s", issueID)
-			description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
-				branch, target, issueID, rigName)
-			if worker != "" {
-				description += fmt.Sprintf("\nworker: %s", worker)
+			if issueID != "" {
+				fmt.Printf("  Issue: %s\n", issueID)
 			}
-			if agentBeadID != "" {
-				description += fmt.Sprintf("\nagent_bead: %s", agentBeadID)
-			}
+			fmt.Println()
+			fmt.Printf("%s\n", style.Dim.Render("No merge request created (direct completion type)."))
 
-			// Add conflict resolution tracking fields (initialized, updated by Refinery)
-			description += "\nretry_count: 0"
-			description += "\nlast_conflict_sha: null"
-			description += "\nconflict_task_id: null"
-
-			// Create MR bead (ephemeral wisp - will be cleaned up after merge)
-			mrIssue, err := bd.Create(beads.CreateOptions{
-				Title:       title,
-				Type:        "merge-request",
-				Priority:    priority,
-				Description: description,
-			})
+		case CompletionDocs:
+			// Documentation work - create MR if there are changes, otherwise just close
+			aheadCount, err := g.CommitsAhead(defaultBranch, branch)
 			if err != nil {
-				return fmt.Errorf("creating merge request bead: %w", err)
+				return fmt.Errorf("checking commits ahead of %s: %w", defaultBranch, err)
 			}
-			mrID = mrIssue.ID
 
-			// Update agent bead with active_mr reference (for traceability)
-			if agentBeadID != "" {
-				if err := bd.UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
-					style.PrintWarning("could not update agent bead with active_mr: %v", err)
+			if aheadCount == 0 {
+				// No changes, just research/doc findings
+				fmt.Printf("%s Documentation work complete (no code changes)\n", style.Bold.Render("✓"))
+				if issueID != "" {
+					fmt.Printf("  Issue: %s\n", issueID)
+				}
+				fmt.Println()
+				fmt.Printf("%s\n", style.Dim.Render("No merge request created (no commits)."))
+			} else {
+				// Has changes, fall through to MR creation
+				mrID, err = createMRBead(bd, g, branch, defaultBranch, issueID, rigName, worker, agentBeadID, donePriority)
+				if err != nil {
+					return err
 				}
 			}
 
-			// Success output
-			fmt.Printf("%s Work submitted to merge queue\n", style.Bold.Render("✓"))
-			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
+		case CompletionConflict:
+			// Conflict resolution - Refinery-dispatched, submit MR with special handling
+			if branch == defaultBranch || branch == "master" {
+				return fmt.Errorf("cannot submit %s/master branch for conflict resolution", defaultBranch)
+			}
+			aheadCount, err := g.CommitsAhead(defaultBranch, branch)
+			if err != nil {
+				return fmt.Errorf("checking commits ahead of %s: %w", defaultBranch, err)
+			}
+			if aheadCount == 0 {
+				return fmt.Errorf("branch '%s' has 0 commits ahead of %s; nothing to merge", branch, defaultBranch)
+			}
+
+			mrID, err = createMRBead(bd, g, branch, defaultBranch, issueID, rigName, worker, agentBeadID, donePriority)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s\n", style.Dim.Render("Conflict resolution submitted to merge queue."))
+
+		default: // CompletionMR - standard MR submission (default)
+			if branch == defaultBranch || branch == "master" {
+				return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
+			}
+			aheadCount, err := g.CommitsAhead(defaultBranch, branch)
+			if err != nil {
+				return fmt.Errorf("checking commits ahead of %s: %w", defaultBranch, err)
+			}
+			if aheadCount == 0 {
+				return fmt.Errorf("branch '%s' has 0 commits ahead of %s; nothing to merge", branch, defaultBranch)
+			}
+
+			if issueID == "" {
+				return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
+			}
+
+			mrID, err = createMRBead(bd, g, branch, defaultBranch, issueID, rigName, worker, agentBeadID, donePriority)
+			if err != nil {
+				return err
+			}
 		}
-		fmt.Printf("  Source: %s\n", branch)
-		fmt.Printf("  Target: %s\n", target)
-		fmt.Printf("  Issue: %s\n", issueID)
-		if worker != "" {
-			fmt.Printf("  Worker: %s\n", worker)
-		}
-		fmt.Printf("  Priority: P%d\n", priority)
-		fmt.Println()
-		fmt.Printf("%s\n", style.Dim.Render("The Refinery will process your merge request."))
 	} else if exitType == ExitPhaseComplete {
 		// Phase complete - register as waiter on gate, then recycle
 		fmt.Printf("%s Phase complete, awaiting gate\n", style.Bold.Render("→"))
@@ -346,13 +393,95 @@ func runDone(cmd *cobra.Command, args []string) error {
 	// Update agent bead state (ZFC: self-report completion)
 	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
 
-	// Handle session self-termination if requested
+	// Self-nuke for polecats: clean up sandbox on exit (gt-fqcst)
+	// Only for COMPLETED status where work is safely submitted to MQ
+	roleInfo, roleErr := GetRoleWithContext(cwd, townRoot)
+	if roleErr == nil && roleInfo.Role == RolePolecat && exitType == ExitCompleted {
+		fmt.Println()
+		fmt.Printf("%s Self-nuking sandbox (polecat cleanup)\n", style.Bold.Render("→"))
+
+		if err := selfNukePolecat(townRoot, roleInfo.Rig, roleInfo.Polecat, cwd, branch); err != nil {
+			// Non-fatal - log warning but still exit
+			// The Witness can clean up any remnants
+			fmt.Fprintf(os.Stderr, "Warning: self-nuke failed: %v\n", err)
+			fmt.Printf("  Witness will handle cleanup.\n")
+		} else {
+			fmt.Printf("  %s Worktree removed\n", style.Success.Render("✓"))
+		}
+
+		fmt.Printf("  Goodbye!\n")
+		os.Exit(0)
+	}
+
+	// Handle session self-termination if requested (non-polecat or non-completed)
 	if doneExit {
 		fmt.Println()
 		fmt.Printf("%s Session self-terminating (--exit flag)\n", style.Bold.Render("→"))
 		fmt.Printf("  Witness will handle worktree cleanup.\n")
 		fmt.Printf("  Goodbye!\n")
 		os.Exit(0)
+	}
+
+	return nil
+}
+
+// selfNukePolecat removes the polecat's worktree and branch after work completion.
+// This implements the polecat self-nuke behavior (gt-fqcst): polecats clean up their own
+// sandbox when they complete work, rather than waiting for Witness/Deacon cleanup.
+//
+// The function assumes:
+// - Work has been pushed to origin (MR bead exists)
+// - Git state is clean (verified by MR creation earlier)
+// - Agent bead has been updated (done in updateAgentStateOnDone)
+//
+// The worktree removal happens while we're still inside it, which is valid in Unix
+// (the process can continue to run, we just can't access the directory afterward).
+func selfNukePolecat(townRoot, rigName, polecatName, worktreePath, _ string) error {
+	rigPath := filepath.Join(townRoot, rigName)
+
+	// Get the repo base (bare repo or mayor/rig)
+	// Same logic as polecat.Manager.repoBase()
+	var repoBasePath string
+	bareRepoPath := filepath.Join(rigPath, ".repo.git")
+	if info, err := os.Stat(bareRepoPath); err == nil && info.IsDir() {
+		// Bare repo exists - use it
+		repoBasePath = bareRepoPath
+	} else {
+		// Fall back to mayor/rig (legacy architecture)
+		repoBasePath = filepath.Join(rigPath, "mayor", "rig")
+	}
+	repoGit := git.NewGit(repoBasePath)
+
+	// Remove the worktree (force mode since we're done with it)
+	if err := repoGit.WorktreeRemove(worktreePath, true); err != nil {
+		// Fall back to direct removal if worktree removal fails
+		if removeErr := os.RemoveAll(worktreePath); removeErr != nil {
+			return fmt.Errorf("removing worktree: %w", removeErr)
+		}
+	}
+
+	// Also remove the parent polecat directory if it's now empty
+	// (for new structure: polecats/<name>/ contains only polecats/<name>/<rigname>/)
+	polecatDir := filepath.Dir(worktreePath)
+	if polecatDir != worktreePath {
+		_ = os.Remove(polecatDir) // Non-fatal: only removes if empty
+	}
+
+	// Prune stale worktree entries
+	_ = repoGit.WorktreePrune()
+
+	// Note: Branch deletion is left to the Refinery after successful merge.
+	// We don't delete the branch here because:
+	// 1. The Refinery might need it for conflict resolution
+	// 2. If merge fails, the branch provides recovery options
+	// 3. Garbage collection (gt polecat gc) handles stale branches
+
+	// Delete agent bead (redundant with updateAgentStateOnDone but ensures cleanup)
+	bd := beads.New(rigPath)
+	agentBeadID := beads.PolecatBeadID(rigName, polecatName)
+	if err := bd.DeleteAgentBead(agentBeadID); err != nil {
+		// Non-fatal - may already be cleaned up
+		fmt.Fprintf(os.Stderr, "Note: agent bead cleanup: %v\n", err)
 	}
 
 	return nil
@@ -478,4 +607,96 @@ func parseCleanupStatus(s string) polecat.CleanupStatus {
 	default:
 		return polecat.CleanupUnknown
 	}
+}
+
+// createMRBead handles the MR bead creation logic for completion types that need it.
+// Returns the MR ID and any error.
+func createMRBead(bd *beads.Beads, g *git.Git, branch, defaultBranch, issueID, rigName, worker, agentBeadID string, priorityOverride int) (string, error) {
+	// Determine target branch (auto-detect integration branch if applicable)
+	target := defaultBranch
+	autoTarget, err := detectIntegrationBranch(bd, g, issueID)
+	if err == nil && autoTarget != "" {
+		target = autoTarget
+	}
+
+	// Get source issue for priority inheritance
+	var priority int
+	if priorityOverride >= 0 {
+		priority = priorityOverride
+	} else {
+		// Try to inherit from source issue
+		sourceIssue, err := bd.Show(issueID)
+		if err != nil {
+			priority = 2 // Default
+		} else {
+			priority = sourceIssue.Priority
+		}
+	}
+
+	// Check if MR bead already exists for this branch (idempotency)
+	existingMR, err := bd.FindMRForBranch(branch)
+	if err != nil {
+		style.PrintWarning("could not check for existing MR: %v", err)
+		// Continue with creation attempt - Create will fail if duplicate
+	}
+
+	var mrID string
+	if existingMR != nil {
+		// MR already exists - use it instead of creating a new one
+		mrID = existingMR.ID
+		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
+		fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
+	} else {
+		// Build MR bead title and description
+		title := fmt.Sprintf("Merge: %s", issueID)
+		description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
+			branch, target, issueID, rigName)
+		if worker != "" {
+			description += fmt.Sprintf("\nworker: %s", worker)
+		}
+		if agentBeadID != "" {
+			description += fmt.Sprintf("\nagent_bead: %s", agentBeadID)
+		}
+
+		// Add conflict resolution tracking fields (initialized, updated by Refinery)
+		description += "\nretry_count: 0"
+		description += "\nlast_conflict_sha: null"
+		description += "\nconflict_task_id: null"
+
+		// Create MR bead (ephemeral wisp - will be cleaned up after merge)
+		mrIssue, err := bd.Create(beads.CreateOptions{
+			Title:       title,
+			Type:        "merge-request",
+			Priority:    priority,
+			Description: description,
+		})
+		if err != nil {
+			return "", fmt.Errorf("creating merge request bead: %w", err)
+		}
+		mrID = mrIssue.ID
+
+		// Update agent bead with active_mr reference (for traceability)
+		if agentBeadID != "" {
+			if err := bd.UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
+				style.PrintWarning("could not update agent bead with active_mr: %v", err)
+			}
+		}
+
+		// Success output
+		fmt.Printf("%s Work submitted to merge queue\n", style.Bold.Render("✓"))
+		fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
+	}
+	fmt.Printf("  Source: %s\n", branch)
+	fmt.Printf("  Target: %s\n", target)
+	if issueID != "" {
+		fmt.Printf("  Issue: %s\n", issueID)
+	}
+	if worker != "" {
+		fmt.Printf("  Worker: %s\n", worker)
+	}
+	fmt.Printf("  Priority: P%d\n", priority)
+	fmt.Println()
+	fmt.Printf("%s\n", style.Dim.Render("The Refinery will process your merge request."))
+
+	return mrID, nil
 }
